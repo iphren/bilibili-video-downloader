@@ -23,6 +23,15 @@ pub struct DownloadChunkTask {
     pub chunk_index: usize,
 }
 
+/// 分片任务的结束方式
+pub enum DownloadChunkResult {
+    /// 分片确实下载完成了，携带分片下标
+    Downloaded(usize),
+    /// 分片被暂停/重来/删除打断了，还没下载完
+    /// 上层不能把它标记为已下载，否则续传时会跳过，留下一个空洞
+    Interrupted,
+}
+
 impl DownloadChunkTask {
     #[instrument(
         level = "error",
@@ -34,7 +43,7 @@ impl DownloadChunkTask {
             end = self.end,
         )
     )]
-    pub async fn process(self) -> eyre::Result<usize> {
+    pub async fn process(self) -> eyre::Result<DownloadChunkResult> {
         let download_chunk_task = self.download_chunk();
         tokio::pin!(download_chunk_task);
 
@@ -67,19 +76,16 @@ impl DownloadChunkTask {
                         }
                     }
                 },
-                // FIXME: 直接返回chunk_index存在进度误标风险
-                // 上层会将这个分片标记为已下载，而分片其实是被打断的
-                // 应该把返回值改成 enum DownloadChunkResult { Downloaded(idx), Interrupted }
-                // 然后由上层处理
-                _ = restart_receiver.changed() => break Ok(self.chunk_index),
+                // 被重来/删除打断，分片还没下载完，交给上层处理
+                _ = restart_receiver.changed() => break Ok(DownloadChunkResult::Interrupted),
 
-                _ = delete_receiver.changed() => break Ok(self.chunk_index),
+                _ = delete_receiver.changed() => break Ok(DownloadChunkResult::Interrupted),
             }
         }
     }
 
     #[instrument(level = "error", skip_all)]
-    async fn download_chunk(&self) -> eyre::Result<usize> {
+    async fn download_chunk(&self) -> eyre::Result<DownloadChunkResult> {
         let bili_client = self.download_task.app.get_bili_client();
         let chunk_data = bili_client
             .get_media_chunk(&self.url, self.start, self.end)
@@ -106,7 +112,7 @@ impl DownloadChunkTask {
             .chunk_download_interval_sec;
         sleep(Duration::from_secs(chunk_download_interval_sec)).await;
 
-        Ok(self.chunk_index)
+        Ok(DownloadChunkResult::Downloaded(self.chunk_index))
     }
 
     #[instrument(level = "error", skip_all)]

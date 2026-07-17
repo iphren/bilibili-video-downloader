@@ -16,7 +16,8 @@ use tracing::{Instrument, instrument};
 use crate::{
     config::FileExistAction,
     downloader::{
-        download_chunk_task::DownloadChunkTask, download_progress::DownloadProgress,
+        download_chunk_task::{DownloadChunkResult, DownloadChunkTask},
+        download_progress::DownloadProgress,
         download_task::DownloadTask, media_chunk::MediaChunk,
     },
     extensions::{AppHandleExt, EyreReportToMessage},
@@ -380,7 +381,12 @@ impl AudioTask {
             };
 
             match download_audio_result {
-                Ok(i) => download_task.update_progress(|p| p.audio_task.chunks[i].completed = true),
+                // 只有确实下载完成的分片才标记为已完成
+                // 被打断的分片保持未完成，续传时会重新下载，避免留下空洞
+                Ok(DownloadChunkResult::Downloaded(i)) => {
+                    download_task.update_progress(|p| p.audio_task.chunks[i].completed = true);
+                }
+                Ok(DownloadChunkResult::Interrupted) => {}
                 Err(err) => {
                     let err_title = "音频的一个分片下载失败";
                     let message = err.to_message();
