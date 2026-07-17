@@ -43,10 +43,10 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const REFERRER: &str = "https://www.bilibili.com/";
 
 /// 分片下载失败后最多重试多少次
-const CHUNK_MAX_RETRIES: u32 = 5;
+const CHUNK_MAX_RETRIES: u32 = 10;
 /// 分片重试的间隔范围
 const CHUNK_RETRY_MIN_INTERVAL: Duration = Duration::from_secs(1);
-const CHUNK_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(15);
+const CHUNK_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(120);
 /// 超过这么久没收到任何数据就认为连接已经死了
 /// 不能用`timeout`(整个请求的超时)，那会误杀正常但缓慢的分片下载
 const CHUNK_READ_TIMEOUT: Duration = Duration::from_secs(15);
