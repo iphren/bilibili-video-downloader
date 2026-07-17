@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use base64::{Engine, engine::general_purpose};
 use bytes::Bytes;
@@ -7,14 +7,16 @@ use parking_lot::RwLock;
 use prost::Message;
 use reqwest::{Client, StatusCode};
 use reqwest_middleware::ClientWithMiddleware;
-use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_retry::{
+    Jitter, RetryDecision, RetryPolicy, RetryTransientMiddleware, policies::ExponentialBackoff,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{
     AppHandle,
     http::{HeaderMap, HeaderValue},
 };
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time::sleep};
 use tracing::{Instrument, instrument};
 
 use crate::{
@@ -39,6 +41,64 @@ use crate::{
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const REFERRER: &str = "https://www.bilibili.com/";
+
+/// 分片下载失败后最多重试多少次
+const CHUNK_MAX_RETRIES: u32 = 5;
+/// 分片重试的间隔范围
+const CHUNK_RETRY_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const CHUNK_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(15);
+/// 超过这么久没收到任何数据就认为连接已经死了
+/// 不能用`timeout`(整个请求的超时)，那会误杀正常但缓慢的分片下载
+const CHUNK_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 单次分片下载尝试的错误，用于区分`可以重试`和`重试没有意义`
+enum ChunkAttemptError {
+    Retryable(eyre::Report),
+    Fatal(eyre::Report),
+}
+
+impl ChunkAttemptError {
+    fn new(retryable: bool, report: eyre::Report) -> Self {
+        if retryable {
+            Self::Retryable(report)
+        } else {
+            Self::Fatal(report)
+        }
+    }
+}
+
+/// 判断http状态码是否值得重试
+fn is_retryable_status(status: StatusCode) -> bool {
+    match status {
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => true,
+        status if status.is_server_error() => true,
+        // 403(链接过期)、404、416(range不合法)重试没有意义
+        // 200说明服务器忽略了range，响应体是整个文件，重试也不会变
+        _ => false,
+    }
+}
+
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_body() || err.is_decode() || err.is_request()
+}
+
+fn is_retryable_middleware_error(err: &reqwest_middleware::Error) -> bool {
+    match err {
+        reqwest_middleware::Error::Reqwest(err) => is_retryable_reqwest_error(err),
+        // 中间件自身的错误(例如代理配置有误)，重试没有意义
+        reqwest_middleware::Error::Middleware(_) => false,
+    }
+}
+
+/// 分片重试的退避策略
+/// base必须是2：base为1时`1^n`恒等于1，退化成固定间隔且`Jitter::Bounded`完全失效
+fn chunk_retry_policy() -> ExponentialBackoff {
+    ExponentialBackoff::builder()
+        .retry_bounds(CHUNK_RETRY_MIN_INTERVAL, CHUNK_RETRY_MAX_INTERVAL)
+        .base(2)
+        .jitter(Jitter::Bounded)
+        .build_with_max_retries(CHUNK_MAX_RETRIES)
+}
 
 pub struct BiliClient {
     pub app: AppHandle,
@@ -792,26 +852,102 @@ impl BiliClient {
         Ok(history_info)
     }
 
-    #[instrument(level = "error", skip_all)]
+    #[instrument(level = "error", skip_all, fields(start = start, end = end))]
     pub async fn get_media_chunk(
         &self,
         media_url: &str,
         start: u64,
         end: u64,
     ) -> eyre::Result<Bytes> {
+        let retry_policy = chunk_retry_policy();
+
+        let start_time = SystemTime::now();
+        let mut n_past_retries: u32 = 0;
+
+        loop {
+            let err = match self.try_get_media_chunk(media_url, start, end).await {
+                Ok(bytes) => {
+                    if n_past_retries > 0 {
+                        tracing::info!("分片重试`{n_past_retries}`次后下载成功");
+                    }
+                    return Ok(bytes);
+                }
+                Err(ChunkAttemptError::Fatal(err)) => return Err(err),
+                Err(ChunkAttemptError::Retryable(err)) => err,
+            };
+
+            let RetryDecision::Retry { execute_after } =
+                retry_policy.should_retry(start_time, n_past_retries)
+            else {
+                return Err(err.wrap_err(format!("重试`{n_past_retries}`次后仍然失败")));
+            };
+            // 时钟回拨时立即重试即可
+            let wait_for = execute_after
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+
+            tracing::warn!(
+                err_title = "分片下载失败，即将重试",
+                n_past_retries,
+                wait_ms = wait_for.as_millis(),
+                message = err.to_message(),
+            );
+            // 这里sleep不影响暂停/重来/删除的响应，`process`的`select!`仍在轮询其他分支
+            sleep(wait_for).await;
+            n_past_retries += 1;
+        }
+    }
+
+    /// 下载一个分片，只尝试一次
+    #[instrument(level = "error", skip_all)]
+    async fn try_get_media_chunk(
+        &self,
+        media_url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes, ChunkAttemptError> {
+        // 必须单独一条语句，让`media_client`的读锁在语句结束时释放，不要跨await持有
         let request = self
             .media_client
             .read()
             .get(media_url)
             .header("range", format!("bytes={start}-{end}"));
-        let http_resp = request.send().await?;
-        // 检查http响应状态码
+
+        let http_resp = match request.send().await {
+            Ok(http_resp) => http_resp,
+            Err(err) => {
+                let retryable = is_retryable_middleware_error(&err);
+                let report = eyre::Report::new(err).wrap_err("发送分片请求失败");
+                return Err(ChunkAttemptError::new(retryable, report));
+            }
+        };
+
+        // 这个检查必须留在重试循环内：服务器可能忽略range返回200(响应体是整个文件)
+        // 那样写到`start`偏移会静默损坏文件
         let status = http_resp.status();
         if status != StatusCode::PARTIAL_CONTENT {
-            return Err(eyre!("预料之外的状态码({status})"));
+            let report = eyre!("预料之外的状态码({status})");
+            return Err(ChunkAttemptError::new(is_retryable_status(status), report));
         }
 
-        let bytes = http_resp.bytes().await?;
+        // B站CDN经常在这里中断连接，这就是分片下载失败的根源
+        // 之前这里的错误不会被重试，因为中间件只重试`send`，而`send`在响应头到达时就返回了
+        let bytes = match http_resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let retryable = is_retryable_reqwest_error(&err);
+                let report = eyre::Report::new(err).wrap_err("读取分片响应体失败");
+                return Err(ChunkAttemptError::new(retryable, report));
+            }
+        };
+
+        // 校验长度，防止服务器返回了别的range导致文件损坏
+        let expected_len = end - start + 1;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            let report = eyre!("分片长度不符(预期`{expected_len}`字节，实际`{actual_len}`字节)");
+            return Err(ChunkAttemptError::Retryable(report));
+        }
 
         Ok(bytes)
     }
@@ -1090,8 +1226,10 @@ impl BiliClient {
 }
 
 fn create_api_client(app: &AppHandle) -> ClientWithMiddleware {
+    // base必须是2：base为1时`1^n`恒等于1，退化成固定间隔且`Jitter::Bounded`完全失效
     let retry_policy = ExponentialBackoff::builder()
-        .base(1)
+        .retry_bounds(Duration::from_secs(1), Duration::from_secs(2))
+        .base(2)
         .jitter(Jitter::Bounded)
         .build_with_total_retry_duration(Duration::from_secs(5));
 
@@ -1112,24 +1250,22 @@ fn create_api_client(app: &AppHandle) -> ClientWithMiddleware {
 }
 
 fn create_media_client(app: &AppHandle) -> ClientWithMiddleware {
-    let retry_policy = ExponentialBackoff::builder()
-        .base(1)
-        .jitter(Jitter::Bounded)
-        .build_with_max_retries(3);
-
     let mut headers = HeaderMap::new();
     headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
     headers.insert("referer", HeaderValue::from_static(REFERRER));
 
     let client = reqwest::ClientBuilder::new()
         .set_proxy(app, "media_client")
+        // 只限制单次读取的间隔，读到数据就重置
+        // 用来发现已经死掉的连接，又不会误杀正常但缓慢的分片下载
+        .read_timeout(CHUNK_READ_TIMEOUT)
         .default_headers(headers)
         .build()
         .unwrap();
 
-    reqwest_middleware::ClientBuilder::new(client)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build()
+    // 不再使用`RetryTransientMiddleware`：它只重试`send`，看不到读取响应体时的失败
+    // 重试逻辑已上移到`get_media_chunk`，覆盖`send`+状态码检查+读取响应体
+    reqwest_middleware::ClientBuilder::new(client).build()
 }
 
 fn create_content_length_client(app: &AppHandle) -> Client {
@@ -1182,4 +1318,123 @@ pub struct BiliResp {
     pub msg: String,
     #[serde(alias = "result")]
     pub data: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        chunk_retry_policy, is_retryable_reqwest_error, is_retryable_status, RetryDecision,
+        RetryPolicy, StatusCode, CHUNK_MAX_RETRIES,
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, SystemTime},
+    };
+
+    /// 返回`should_retry`要求等待的时长，`DoNotRetry`时返回`None`
+    fn wait_for(n_past_retries: u32) -> Option<Duration> {
+        let now = SystemTime::now();
+        match chunk_retry_policy().should_retry(now, n_past_retries) {
+            RetryDecision::Retry { execute_after } => {
+                Some(execute_after.duration_since(now).unwrap_or_default())
+            }
+            RetryDecision::DoNotRetry => None,
+        }
+    }
+
+    /// 这是`base(1)`那个bug的回归测试
+    /// `base`为1时`1^n`恒等于1，每次都恰好等待1秒，`Jitter::Bounded`也会被完全抵消
+    /// 所以这里断言等待时长确实会随重试次数增长
+    /// jitter是随机的，单次采样可能偏小，因此多采样几次看最大值
+    #[test]
+    fn 重试间隔应该随次数增长() {
+        // 第0次重试恒等于最小间隔，这是`Jitter::Bounded`的固有行为
+        // 留一点余量：`should_retry`内部重新取了一次`now`，会比这里晚几微秒
+        let first_wait = wait_for(0).unwrap();
+        assert!(
+            (Duration::from_secs(1)..Duration::from_millis(1100)).contains(&first_wait),
+            "第0次重试应该恰好等待最小间隔，实际`{first_wait:?}`"
+        );
+
+        // 第2次重试的未抖动间隔是4秒，抖动后落在[1s, 4s]
+        // 如果`base`是1，这里恒等于1秒，取多少次最大值都不会超过1秒
+        let max_wait = (0..20).filter_map(|_| wait_for(2)).max().unwrap();
+        assert!(
+            max_wait > Duration::from_millis(1500),
+            "重试间隔没有随次数增长，`base`可能被改回了1，实际最大间隔`{max_wait:?}`"
+        );
+    }
+
+    #[test]
+    fn 重试间隔不应该超过上限() {
+        for _ in 0..20 {
+            assert!(wait_for(4).unwrap() <= Duration::from_secs(15));
+        }
+    }
+
+    #[test]
+    fn 超过最大重试次数后应该放弃() {
+        assert!(wait_for(CHUNK_MAX_RETRIES - 1).is_some());
+        assert_eq!(wait_for(CHUNK_MAX_RETRIES), None);
+    }
+
+    /// 复现线上的分片下载失败：服务器声明了`Content-Length`，但发到一半就断开连接
+    /// 这正是`end of file before message length reached`的成因
+    /// 断言这种错误会被判定为`可以重试`，否则就回到了这个bug本身
+    #[tokio::test]
+    async fn 响应体中途断开应该判定为可以重试() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // 声明1000字节，实际只发10字节就断开
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\n\
+                      Content-Length: 1000\r\n\
+                      Content-Range: bytes 0-999/2000\r\n\r\n\
+                      0123456789",
+                )
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let http_resp = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("响应头是完整的，`send`应该成功");
+        // 这就是问题的核心：`send`成功了，中间件到此为止，然后读取响应体才失败
+        assert_eq!(http_resp.status(), StatusCode::PARTIAL_CONTENT);
+
+        let err = http_resp.bytes().await.expect_err("响应体不完整，应该失败");
+        assert!(
+            is_retryable_reqwest_error(&err),
+            "响应体中途断开必须能重试，实际错误`{err:?}`"
+        );
+    }
+
+    #[test]
+    fn 链接过期等状态码不应该重试() {
+        // 403是链接过期，404是资源不存在，416是range不合法，重试没有意义
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::RANGE_NOT_SATISFIABLE));
+        // 200说明服务器忽略了range，重试也不会变
+        assert!(!is_retryable_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn 暂时性故障应该重试() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
+    }
 }
