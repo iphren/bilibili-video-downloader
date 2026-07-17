@@ -1324,7 +1324,7 @@ pub struct BiliResp {
 mod tests {
     use super::{
         chunk_retry_policy, is_retryable_reqwest_error, is_retryable_status, RetryDecision,
-        RetryPolicy, StatusCode, CHUNK_MAX_RETRIES,
+        RetryPolicy, StatusCode, CHUNK_MAX_RETRIES, CHUNK_RETRY_MAX_INTERVAL,
     };
     use std::{
         io::{Read, Write},
@@ -1368,8 +1368,14 @@ mod tests {
 
     #[test]
     fn 重试间隔不应该超过上限() {
+        // 取一个未抖动间隔(`2^n`秒)远超上限的重试次数，确保真的触发了封顶
+        let n = CHUNK_MAX_RETRIES - 1;
+        assert!(
+            2u64.pow(n) > CHUNK_RETRY_MAX_INTERVAL.as_secs(),
+            "第`{n}`次重试的未抖动间隔没有超过上限，这个测试没测到封顶"
+        );
         for _ in 0..20 {
-            assert!(wait_for(4).unwrap() <= Duration::from_secs(15));
+            assert!(wait_for(n).unwrap() <= CHUNK_RETRY_MAX_INTERVAL);
         }
     }
 
