@@ -80,6 +80,13 @@ fi
 
 mkdir -p "$DST"
 
+# Encode into a local temp dir (NOT the destination). This keeps failed/partial
+# encodes out of the destination entirely, and — since the destination is iCloud
+# Drive — avoids iCloud uploading a half-written file during every long encode.
+# The finished file is moved into the destination only on success.
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/compress-for-phone.XXXXXX")"
+trap 'rm -rf "$workdir"' EXIT
+
 # Collect video files (case-insensitive extensions), NUL-delimited to survive
 # spaces and non-ASCII characters in the CJK filenames.
 videos=()
@@ -113,7 +120,7 @@ for src in "${videos[@]}"; do
   rel="${src#"$SRC"/}"
   rel_noext="${rel%.*}"
   out="$DST/$rel_noext.mp4"
-  tmp="$DST/$rel_noext.part.mp4"
+  work="$workdir/out.mp4"     # local temp target for this encode
 
   printf '[%d/%d] %s\n' "$i" "$total" "$rel"
 
@@ -123,8 +130,7 @@ for src in "${videos[@]}"; do
     continue
   fi
 
-  mkdir -p "$(dirname "$out")"
-  rm -f "$tmp"
+  rm -f "$work"
 
   if ffmpeg -nostdin -hide_banner -loglevel error -stats -y \
     -i "$src" \
@@ -132,12 +138,20 @@ for src in "${videos[@]}"; do
     -c:v libx265 -crf "$CRF" -preset "$PRESET" -tag:v hvc1 \
     -c:a aac -b:a "$AUDIO_BITRATE" \
     -movflags +faststart \
-    "$tmp"; then
-    mv -f "$tmp" "$out"
+    "$work"; then
+    # Only now touch the destination: copy the finished file into place under a
+    # temp name (cross-device copy into iCloud), then atomically rename. This way
+    # the destination never holds a partial file that the skip check above would
+    # later mistake for a completed conversion.
+    mkdir -p "$(dirname "$out")"
+    part="$out.part"
+    rm -f "$part"
+    mv -f "$work" "$part"
+    mv -f "$part" "$out"
     echo "        → done: $out"
     converted=$((converted + 1))
   else
-    rm -f "$tmp"
+    rm -f "$work"
     echo "        → FAILED: $src" >&2
     failed=$((failed + 1))
   fi
