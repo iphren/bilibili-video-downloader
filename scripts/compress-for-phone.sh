@@ -3,13 +3,20 @@
 # compress-for-phone.sh
 #
 # Transcode downloaded Bilibili videos into small, phone-friendly copies for
-# offline viewing, mirroring the source folder structure into iCloud Drive.
+# offline viewing, laid out as a Jellyfin/Plex/Infuse TV library in iCloud Drive.
 #
 #   Source: ~/Library/Application Support/com.lanyeeee.bilibili-video-downloader/视频下载
 #   Dest:   ~/Library/Mobile Documents/com~apple~CloudDocs/Videos/Offline
 #
 # Output: 360p (long edge capped, aspect preserved) / 15 fps / HEVC CRF 30.
 # Only video files are converted; subtitles, danmaku, .nfo/.jpg/.json are ignored.
+#
+# Each source file "<series>/NNNN.<title>.mp4" becomes a TV-library entry:
+#   <show>/Season 01/<show> - S01E<NN> - <title>.mp4
+# where <show> is the series folder mapped through SHOW_NAMES below (falling back
+# to the folder name), <NN> is the NNNN prefix, and <title> is the rest of the
+# filename. TV metadata (show / season / episode / title, iTunes media_type 10)
+# is embedded into each newly converted file.
 #
 # Usage:
 #   ./compress-for-phone.sh [-n COUNT] [SRC_DIR] [DST_DIR]
@@ -68,6 +75,22 @@ CRF=30
 PRESET=medium
 AUDIO_BITRATE=96k
 
+# Every series is treated as a single season.
+SEASON="01"
+
+# Map a source series folder name to the show name used in the TV-library layout
+# and metadata. Add a `"<folder>") echo "<show>";;` case to simplify/rename a
+# series; folders with no case fall through to their own name unchanged.
+# (A function + case is used instead of an associative array so the script runs
+# on macOS's stock bash 3.2, which has no `declare -A`.)
+map_show() {
+  case "$1" in
+    "【周易精讲】细读百家之祖，万法之源") echo "周易精讲" ;;
+    # "【某某】长长的副标题") echo "某某" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "error: ffmpeg not found on PATH" >&2
   exit 1
@@ -116,13 +139,26 @@ i=0
 for src in "${videos[@]}"; do
   i=$((i + 1))
 
-  # Path relative to SRC, with the extension forced to .mp4.
   rel="${src#"$SRC"/}"
-  rel_noext="${rel%.*}"
-  out="$DST/$rel_noext.mp4"
   work="$workdir/out.mp4"     # local temp target for this encode
 
   printf '[%d/%d] %s\n' "$i" "$total" "$rel"
+
+  # Derive the TV-library naming from "<series>/…/NNNN.<title>.<ext>".
+  series="${rel%%/*}"                 # first path component = series folder
+  base="$(basename "$rel")"
+  base="${base%.*}"                   # strip extension
+  if [[ ! "$base" =~ ^([0-9]+)\.(.+)$ ]]; then
+    echo "        → skip (no NNNN. episode prefix)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  epnum="${BASH_REMATCH[1]}"
+  title="${BASH_REMATCH[2]}"
+  show="$(map_show "$series")"
+  ep=$((10#$epnum))                   # integer episode number, leading zeros stripped
+  eppad="$(printf '%02d' "$ep")"
+  out="$DST/$show/Season $SEASON/$show - S${SEASON}E${eppad} - $title.mp4"
 
   if [[ -s "$out" ]]; then
     echo "        → skip (already converted)"
@@ -137,6 +173,12 @@ for src in "${videos[@]}"; do
     -vf "scale=w=${SCALE_LONG_EDGE}:h=${SCALE_SHORT_EDGE}:force_original_aspect_ratio=decrease,fps=${FPS}" \
     -c:v libx265 -crf "$CRF" -preset "$PRESET" -tag:v hvc1 \
     -c:a aac -b:a "$AUDIO_BITRATE" \
+    -metadata title="$title" \
+    -metadata show="$show" \
+    -metadata episode_id="$title" \
+    -metadata episode_sort="$ep" \
+    -metadata season_number="$((10#$SEASON))" \
+    -metadata media_type=10 \
     -movflags +faststart \
     "$work"; then
     # Only now touch the destination: copy the finished file into place under a
