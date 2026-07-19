@@ -29,13 +29,25 @@
 # In Jellyfin: add the destination as a *Shows* library, enable the Nfo metadata
 # reader, and disable the online (TheMovieDB/TheTVDB) fetchers for series/episodes.
 #
+# The library is built locally (fast, offline, doubles as a backup) and then
+# rsync'd to the Jellyfin server. The push is additive (no --delete), so files
+# already on the server are skipped and only new episodes/sidecars are sent.
+#
 # Usage:
-#   ./compress-for-phone.sh [-n COUNT] [SRC_DIR] [DST_DIR]
+#   ./compress-for-phone.sh [-n COUNT] [--no-push] [--push-to TARGET] [SRC_DIR] [DST_DIR]
 #
 # Options:
 #   -n, --limit COUNT   Convert at most COUNT new videos, then stop. Already-
 #                       converted files that are skipped do NOT count toward the
 #                       limit, so `-n 3` always encodes the next 3 pending videos.
+#   --no-push           Build the local library only; skip the rsync to the server.
+#   --push-to TARGET    Override the rsync target. TARGET is an rsync destination,
+#                       e.g. "home:/mnt/sda/jellyfin-library/shows" (remote) or a
+#                       local/mounted path like "/Volumes/shows".
+#   --posters DIR       Directory of custom show posters (default: a "poster-
+#                       overrides" folder next to DST). Drop "<show>.jpg" (or
+#                       .jpeg/.png) files there and they take precedence over the
+#                       source poster, without touching the source folder.
 #
 # Re-running is safe: files already converted (and non-empty) are skipped, so a
 # second run only encodes newly downloaded videos.
@@ -43,8 +55,11 @@
 set -euo pipefail
 
 LIMIT=0  # 0 means no limit
+PUSH=1   # rsync the built library to the server after building
+REMOTE="home:/mnt/sda/jellyfin-library/shows"  # rsync target; empty disables push
+POSTER_DIR=""  # custom-poster overrides dir; defaults next to DST once DST is known
 
-# Parse the -n/--limit flag; remaining args are the optional SRC and DST paths.
+# Parse options; remaining args are the optional SRC and DST paths.
 positional=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +67,26 @@ while [[ $# -gt 0 ]]; do
       LIMIT="${2:-}"
       if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
         echo "error: $1 requires a non-negative integer, got: '${2:-}'" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --no-push)
+      PUSH=0
+      shift
+      ;;
+    --push-to)
+      REMOTE="${2:-}"
+      if [[ -z "$REMOTE" ]]; then
+        echo "error: --push-to requires a target (e.g. host:/path or /mnt/path)" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --posters)
+      POSTER_DIR="${2:-}"
+      if [[ -z "$POSTER_DIR" ]]; then
+        echo "error: --posters requires a directory" >&2
         exit 1
       fi
       shift 2
@@ -77,6 +112,9 @@ done
 
 SRC="${positional[0]:-$HOME/Library/Application Support/com.lanyeeee.bilibili-video-downloader/视频下载}"
 DST="${positional[1]:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/Videos/Library}"
+# Custom posters live next to the library by default (outside SRC and outside the
+# generated tree, so they survive rebuilds and are never pushed themselves).
+[[ -z "$POSTER_DIR" ]] && POSTER_DIR="$(dirname "$DST")/poster-overrides"
 
 # Encoding knobs — tweak here if you want a different size/quality tradeoff.
 SCALE_LONG_EDGE=640   # width cap
@@ -175,6 +213,34 @@ ET.ElementTree(root).write(out, encoding="utf-8", xml_declaration=True)
 PY
 }
 
+# Replace a show's poster.jpg with a custom override, if one exists in POSTER_DIR
+# named "<show>.jpg" (or .jpeg/.png). PNG overrides are converted to JPEG so the
+# result is always a single canonical poster.jpg — that keeps the additive rsync
+# from leaving a stale poster of a different extension on the server. The copy is
+# content-based so it correctly overrides the source poster and stays idempotent.
+#   args: show_dir  show
+apply_poster_override() {
+  [[ -n "$POSTER_DIR" && -d "$POSTER_DIR" ]] || return 0
+  local show_dir="$1" show="$2" ovr="" cand
+  for cand in "$POSTER_DIR/$show.jpg" "$POSTER_DIR/$show.jpeg" "$POSTER_DIR/$show.png"; do
+    [[ -f "$cand" ]] && { ovr="$cand"; break; }
+  done
+  [[ -n "$ovr" ]] || return 0
+
+  local target="$show_dir/poster.jpg" newimg="$ovr"
+  if [[ "$ovr" == *.png ]]; then
+    newimg="$workdir/poster-override.jpg"
+    ffmpeg -nostdin -hide_banner -loglevel error -y -i "$ovr" "$newimg"
+  fi
+  if [[ ! -f "$target" ]] || ! cmp -s "$newimg" "$target"; then
+    mkdir -p "$show_dir"
+    cp "$newimg" "$target"
+    echo "        poster ← $(basename "$ovr")  [$show]"
+    meta=$((meta + 1))
+  fi
+  return 0
+}
+
 mkdir -p "$DST"
 
 # Encode into a local temp dir (NOT the destination). This keeps failed/partial
@@ -194,15 +260,12 @@ done < <(find "$SRC" -type f \( \
   -iname '*.mov' -o -iname '*.m4v' \) -print0 | sort -z)
 
 total="${#videos[@]}"
-if [[ "$total" -eq 0 ]]; then
-  echo "No video files found under: $SRC"
-  exit 0
-fi
-
-echo "Found $total video(s)."
-echo "  Source: $SRC"
-echo "  Dest:   $DST"
-[[ "$LIMIT" -gt 0 ]] && echo "  Limit:  convert up to $LIMIT new video(s)"
+echo "Found $total source video(s)."
+echo "  Source:  $SRC"
+echo "  Dest:    $DST"
+echo "  Posters: $POSTER_DIR"
+[[ "$LIMIT" -gt 0 ]] && echo "  Limit:   convert up to $LIMIT new video(s)"
+[[ "$total" -eq 0 ]] && echo "  (no source videos — will still refresh metadata/posters and push)"
 echo
 
 converted=0
@@ -211,7 +274,9 @@ failed=0
 meta=0
 i=0
 
-for src in "${videos[@]}"; do
+# Only iterate when there are videos: "${videos[@]}" on an empty array trips
+# `set -u` on bash 3.2.
+for src in ${videos[@]+"${videos[@]}"}; do
   i=$((i + 1))
 
   rel="${src#"$SRC"/}"
@@ -327,6 +392,42 @@ while IFS= read -r -d '' mp4; do
   fi
 done < <(find "$DST" -type f -iname '*.mp4' -not -path '*/.*' -print0 | sort -z)
 
+# Poster overrides: for every show directory, apply a custom poster from
+# POSTER_DIR if one exists (takes precedence over the source poster). Runs once
+# per show (hidden dirs like .claude are skipped).
+while IFS= read -r -d '' d; do
+  apply_poster_override "$d" "$(basename "$d")"
+done < <(find "$DST" -mindepth 1 -maxdepth 1 -type d -not -name '.*' -print0 | sort -z)
+
+# Deliver the built library to the Jellyfin server (or a local/mounted path). The
+# push is additive — no --delete — so files already there are skipped and only new
+# episodes / missing sidecars are transferred. Dotfiles (.DS_Store, .claude, …)
+# are excluded.
+push_failed=0
+if [[ "$PUSH" -eq 1 && -n "$REMOTE" ]]; then
+  echo
+  echo "Pushing → $REMOTE …"
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "error: rsync not found on PATH (needed to push; use --no-push to skip)" >&2
+    push_failed=1
+  else
+    # Make sure the destination base dir exists. Treat "host:path" as remote.
+    if [[ "$REMOTE" == *:* && "$REMOTE" != /* ]]; then
+      ssh "${REMOTE%%:*}" mkdir -p "${REMOTE#*:}" || push_failed=1
+    else
+      mkdir -p "$REMOTE" || push_failed=1
+    fi
+    if [[ "$push_failed" -eq 0 ]]; then
+      if rsync -a --exclude='.*' "$DST/" "$REMOTE/"; then
+        echo "Push complete."
+      else
+        echo "error: rsync push to $REMOTE failed" >&2
+        push_failed=1
+      fi
+    fi
+  fi
+fi
+
 echo
 echo "Summary: $converted converted, $skipped skipped, $failed failed, $meta metadata file(s) written (of $total)."
-[[ "$failed" -eq 0 ]]
+[[ "$failed" -eq 0 && "$push_failed" -eq 0 ]]
