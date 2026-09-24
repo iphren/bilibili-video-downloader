@@ -8,7 +8,8 @@ use prost::Message;
 use reqwest::{Client, StatusCode};
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::{
-    Jitter, RetryDecision, RetryPolicy, RetryTransientMiddleware, policies::ExponentialBackoff,
+    Jitter, RetryDecision, RetryPolicy, RetryTransientMiddleware, Retryable, RetryableStrategy,
+    default_on_request_failure, default_on_request_success, policies::ExponentialBackoff,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -244,15 +245,18 @@ impl BiliClient {
     #[instrument(level = "error", skip_all, fields(bvid = params.get_bvid(), aid = params.get_aid()))]
     pub async fn get_normal_info(&self, params: GetNormalInfoParams) -> eyre::Result<NormalInfo> {
         use GetNormalInfoParams::{Aid, Bvid};
-        let params = match params {
-            Bvid(bvid) => json!({"bvid": bvid}),
-            Aid(aid) => json!({"aid": aid}),
+        let mut params: Vec<(&str, String)> = match params {
+            Bvid(bvid) => vec![("bvid", bvid)],
+            Aid(aid) => vec![("aid", aid.to_string())],
         };
+        // 未签名的`/x/web-interface/view`已被风控拦截(必定返回412)
+        // 必须改用需要wbi签名的`/x/web-interface/wbi/view`
+        self.wbi(&mut params).await?;
         // 发送获取普通视频信息的请求
         let request = self
             .api_client
             .read()
-            .get("https://api.bilibili.com/x/web-interface/view")
+            .get("https://api.bilibili.com/x/web-interface/wbi/view")
             .query(&params)
             .header("cookie", self.get_cookie());
         let http_resp = request.send().await?;
@@ -1225,6 +1229,26 @@ impl BiliClient {
     }
 }
 
+/// bilibili的风控会间歇性地返回412，重试一般就能成功
+/// `DefaultRetryableStrategy`把除408/429外的4xx全部视为不可重试，412也在其中
+/// 所以这里单独把412标记为`Transient`，其余情况沿用默认判断
+struct RiskControlRetryableStrategy;
+
+impl RetryableStrategy for RiskControlRetryableStrategy {
+    fn handle(
+        &self,
+        res: &Result<reqwest::Response, reqwest_middleware::Error>,
+    ) -> Option<Retryable> {
+        match res {
+            Ok(resp) if resp.status() == StatusCode::PRECONDITION_FAILED => {
+                Some(Retryable::Transient)
+            }
+            Ok(resp) => default_on_request_success(resp),
+            Err(err) => default_on_request_failure(err),
+        }
+    }
+}
+
 fn create_api_client(app: &AppHandle) -> ClientWithMiddleware {
     // base必须是2：base为1时`1^n`恒等于1，退化成固定间隔且`Jitter::Bounded`完全失效
     let retry_policy = ExponentialBackoff::builder()
@@ -1245,7 +1269,10 @@ fn create_api_client(app: &AppHandle) -> ClientWithMiddleware {
         .unwrap();
 
     reqwest_middleware::ClientBuilder::new(client)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+            retry_policy,
+            RiskControlRetryableStrategy,
+        ))
         .build()
 }
 
