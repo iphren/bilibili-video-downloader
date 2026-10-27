@@ -8,7 +8,13 @@
 #   Source: ~/Library/Application Support/com.lanyeeee.bilibili-video-downloader/视频下载
 #   Dest:   ~/Library/Mobile Documents/com~apple~CloudDocs/Videos/Library
 #
-# Output: 360p (long edge capped, aspect preserved) / 15 fps / HEVC CRF 30.
+# Output: 360p (long edge capped, aspect preserved) / 15 fps / H.264 High CRF 23,
+# with a fixed keyframe every 2 s, AAC audio (copied when the source is AAC), and
+# +faststart. The fixed GOP matters: when a client can't direct-play, Jellyfin
+# remuxes to HLS with 6 s segments, which ffmpeg can only cut at keyframes. Sparse
+# keyframes (the old HEVC encodes had one every 16.7 s) caused rewinds, freezes and
+# a missing "ended" event (no next-episode autoplay). Every encode is checked
+# (max keyframe gap and duration) before it's moved into the destination.
 #
 # Each source file "<series>/NNNN.<title>.mp4" becomes a TV-library entry:
 #   <show>/Season 01/<show> - S01E<NN> - <title>.mp4
@@ -120,9 +126,12 @@ DST="${positional[1]:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/Videos/
 SCALE_LONG_EDGE=640   # width cap
 SCALE_SHORT_EDGE=360  # height cap
 FPS=15
-CRF=30
+CRF=23
 PRESET=medium
-AUDIO_BITRATE=96k
+AUDIO_BITRATE=96k     # only used when the source audio isn't already AAC
+GOP=$((FPS * 2))      # fixed keyframe interval: 2 s at the output frame rate
+MAX_KEYFRAME_GAP=2    # verify: largest allowed keyframe gap, in seconds
+MAX_DURATION_DIFF=1   # verify: allowed output-vs-source duration difference, in seconds
 
 # Every series is treated as a single season.
 SEASON="01"
@@ -140,10 +149,12 @@ map_show() {
   esac
 }
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "error: ffmpeg not found on PATH" >&2
-  exit 1
-fi
+for tool in ffmpeg ffprobe; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "error: $tool not found on PATH" >&2
+    exit 1
+  fi
+done
 
 # python3 builds the NFO XML — it escapes CJK/&<> correctly and can read the
 # source Kodi .nfo, which is far safer than assembling XML by hand in bash.
@@ -241,6 +252,32 @@ apply_poster_override() {
   return 0
 }
 
+# Print a file's video stream duration in seconds. The stream (not the container)
+# is used because a chapter track can make the container duration misleading.
+probe_duration() {
+  ffprobe -v error -select_streams V:0 -show_entries stream=duration -of default=nw=1:nk=1 "$1"
+}
+
+# Check a finished encode before it's delivered: the largest gap between video
+# keyframes must be <= MAX_KEYFRAME_GAP and the duration must match the source
+# within MAX_DURATION_DIFF. Prints the result; returns non-zero on failure.
+#   args: encoded_file  source_file
+verify_output() {
+  local out="$1" src="$2" kf src_dur out_dur
+  kf="$(ffprobe -v error -select_streams V:0 -show_entries packet=pts_time,flags -of csv=p=0 "$out" \
+    | awk -F, '$2~/K/{if(n){d=$1-p;if(d>m)m=d}p=$1;n++}END{printf "%d %.3f", n, m}')"
+  src_dur="$(probe_duration "$src")"
+  out_dur="$(probe_duration "$out")"
+  awk -v kf="$kf" -v sd="$src_dur" -v od="$out_dur" \
+    -v maxgap="$MAX_KEYFRAME_GAP" -v maxdiff="$MAX_DURATION_DIFF" 'BEGIN {
+      split(kf, k, " ")
+      diff = od - sd; if (diff < 0) diff = -diff
+      printf "        verify: %d keyframes, max gap %.3fs; duration %.2fs vs source %.2fs\n", k[1], k[2], od, sd
+      if (k[1] < 1 || k[2] > maxgap) { print "        verify: keyframe gap too large" > "/dev/stderr"; exit 1 }
+      if (sd == "" || od == "" || diff > maxdiff) { print "        verify: duration mismatch" > "/dev/stderr"; exit 1 }
+    }'
+}
+
 mkdir -p "$DST"
 
 # Encode into a local temp dir (NOT the destination). This keeps failed/partial
@@ -311,11 +348,23 @@ for src in ${videos[@]+"${videos[@]}"}; do
     continue
   else
     rm -f "$work"
+    # Copy the audio when every source audio stream is already AAC; otherwise
+    # re-encode it to AAC.
+    acodecs="$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$src" | sort -u)"
+    if [[ "$acodecs" == "aac" ]]; then
+      audio_args=(-c:a copy)
+    else
+      audio_args=(-c:a aac -b:a "$AUDIO_BITRATE")
+    fi
+    # 0:V:0 is the first real video stream (skips embedded cover art); 0:a? keeps
+    # all audio and tolerates sources without any. Data streams are dropped.
     if ffmpeg -nostdin -hide_banner -loglevel error -stats -y \
       -i "$src" \
-      -vf "scale=w=${SCALE_LONG_EDGE}:h=${SCALE_SHORT_EDGE}:force_original_aspect_ratio=decrease,fps=${FPS}" \
-      -c:v libx265 -crf "$CRF" -preset "$PRESET" -tag:v hvc1 \
-      -c:a aac -b:a "$AUDIO_BITRATE" \
+      -map 0:V:0 -map '0:a?' \
+      -vf "scale=w=${SCALE_LONG_EDGE}:h=${SCALE_SHORT_EDGE}:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=${FPS}" \
+      -c:v libx264 -preset "$PRESET" -crf "$CRF" -profile:v high -pix_fmt yuv420p \
+      -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 \
+      "${audio_args[@]}" \
       -metadata title="$title" \
       -metadata show="$show" \
       -metadata episode_id="$title" \
@@ -323,7 +372,7 @@ for src in ${videos[@]+"${videos[@]}"}; do
       -metadata season_number="$((10#$SEASON))" \
       -metadata media_type=10 \
       -movflags +faststart \
-      "$work"; then
+      "$work" && verify_output "$work" "$src"; then
       # Only now touch the destination: copy the finished file into place under a
       # temp name (cross-device copy into iCloud), then atomically rename. This way
       # the destination never holds a partial file that the skip check above would
